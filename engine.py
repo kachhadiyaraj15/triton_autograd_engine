@@ -231,6 +231,122 @@ class TritonTensor:
         return out
     
     def _unary(self, op):
-        pass
+        assert self.data.is_contiguous(), "Tensor must be contiguous"
         
+        # Preallocating the output
+        output = torch.empty_like(self.data)
+        
+        # Define grid based on tensor dimensions
+        n_elements = self.data.numel()
+        grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+        # Launch kernel
+        elementwise.unary_op_forward[grid](
+            self.data, output,
+            n_elements,
+            OP = op, # designates which operation to run (addition, subtraction, multiplication, division)
+        )
+        
+        # Wrap output in Tensor with autograd information
+        out = TritonTensor(
+            output,
+            requires_grad = self.requires_grad,
+            _children = (self,)
+        )
+        
+        # Define backward pass
+        def _backward():
+            if self.requires_grad:
+                elementwise.unary_op_backward[grid](
+                    self.data, self.grad, 
+                    out.data, out.grad,
+                    n_elements,
+                    op,
+                )
+        out._backward = _backward
+        return out
+    
+    def exp(self):
+        return self._unary(op = "exp")
+    
+    def log(self):
+        return self._unary(op = "log")
+    
+    def relu(self):
+        return self._unary(op = "relu")
+    
+    def _reduction(self, op):
+        """
+        all reduction ops (sum, min, max, etc) move through here
+        it's a relatively inflexible module; we only support reduction along the tensor's final dimension
+        """
+        assert self.data.is_contiguous(), "Tensor must be contiguous"
+        
+        # Preallocating the output
+        output = torch.empty(self.data.shape[:-1], device = self.device, dtype = self.dtype, requires_grad = False)
+        
+        # Get tensor dimensions to ensure or parallelization will work
+        n_cols = self.shape[-1]
+        BLOCK_SIZE_N = triton.next_power_of_2(n_cols)
+        # 4 for the 4 bytes in fp32
+        assert BLOCK_SIZE_N * 4 < TOTAL_SRAM_PER_SM, \
+            f"Vectors (each size {BLOCK_SIZE_N * 4} too large for SRAM, max size {TOTAL_SRAM_PER_SM})"
+        
+        # Parallelize with multiple rows in a PID
+        grid = lambda meta: (
+            triton.cdiv(self.data.numel() // n_cols, meta['BLOCK_SIZE_M']),
+        )
+        # Launch kernel
+        vectorwise.reduction_op_forward[grid](
+            self.data, output,
+            self.data.numel(), output.numel(),
+            self.data.stride()[-2], n_cols,
+            op, 
+            BLOCK_SIZE_N = BLOCK_SIZE_N,
+        )
+        
+        # Wrap output in Tensor with autograd information
+        out = TritonTensor(
+            output,
+            requires_grad = self.requires_grad,
+            _children = (self,)
+        )
+        
+        # define our backward pass
+        def _backward():
+            if self.requires_grad:
+                vectorwise.reduction_op_backward[grid](
+                    self.data,
+                    self.grad, out.grad,
+                    self.grad.numel(), out.grad.numel(),
+                    self.data.stride()[-2], n_cols, 
+                    op, 
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                )
+        out._backward = _backward
+
+        return out
+    
+    def sum(self):
+        return self._reduction(op='sum')
+
+    def mean(self):
+        return self._reduction(op='mean')
+
+    def max(self):
+        return self._reduction(op='max')
+
+    def min(self):
+        return self._reduction(op='min')
+
+    def var(self):
+        return self._reduction(op='var')
+
+    def std(self):
+        return self._reduction(op='std')
+
+    def softmax(self):
+        pass
+    
+    
+
         
