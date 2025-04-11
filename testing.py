@@ -128,6 +128,7 @@ def test_operation(op_name: str,
     print(f"Testing {op_name} operation")
     
     # Generate random inputs
+    # Why this we are using, why not directly use it 
     torch_inputs = [x.detach().clone().require_grad_(x.requires_grad) for x in inputs_list ] # Create leaf tensors
     triton_inputs = [TritonTensor(x, requires_grad=x.requires_grad) for x in inputs_list]
     
@@ -152,10 +153,11 @@ def test_operation(op_name: str,
     
     # before computing the backward pass, we need to let the autotuner run
     # This needs to be done bc otherwise the gradient accumulation of each run would compund to incorrect values
+    # This is to run the autotuner for the Triton kernel without actually affecting gradient values (i.e., using a zero gradient).
     zero_grad = torch.zeros_like(torch_out)
     triton_out.backward(zero_grad)
     
-    # and in order to avoid any potential divide by zero Nan's from division, ew et all gradients to zero
+    # and in order to avoid any potential divide by zero Nan's from division, we set all gradients to zero
     triton_out.zero_grad_backward()
     
     # Backward pass
