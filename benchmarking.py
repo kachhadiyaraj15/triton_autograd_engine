@@ -8,7 +8,7 @@ import triton.language as tl
 
 from engine import TritonTensor
 
-from kernels import elementwise, matmul, vectorwise, modules, flash_attetntion
+from kernels import elementwise, matmul, vectorwise, modules, flash_attention
 
 DEVICE = torch.device(f"cuda:{torch.cuda.current_device()}")
 properties = triton.runtime.driver.active.utils.get.get_device_properties(DEVICE.index)
@@ -774,7 +774,151 @@ def benchmark_layernorm(D, provider, op, mode, device=DEVICE):
         gb = ((3 * B * N * D) + (2 * B * N) + (3 * D)) * 4 * 1e-9
     ms = triton.testing.do_bench
     return gb / (ms * 1e-3)
-       
+
+########################################################################################
+########################### Flash Attention Module #####################################
+########################################################################################
+
+class _flashattention(torch.autograd.Function):
+    
+    @staticmethod
+    def forward(ctx, q, k, v, scale):
+        """
+        Implementation of Flash Attention
+        """
+        assert q.shape == k.shape == v.shape, "q, k, and v must have the same shape"
+        assert q.shape[-1] in (32, 64, 128, 256), \
+            f"q, k, and v must have a last dimension of 32, 64, 128, or 256, but got {q.shape[-1]}"
+        B, H, N, D = q.shape
+        assert q.device == k.device == v.device, "q, k, and v must be on the same device"
+        
+        # Pre allocate output tensor
+        O = torch.empty_like(q) # output tensor will be pre head concatenation and mixing
+        # and pre-allocate the tensor where we hold the logsumexp
+        LSE = torch.empty((B, H, N), device = q.device, dtype = torch.float32)
+        
+        grid = lambda args : (
+            triton.cdiv(N, args["BLOCK_SIZE_QO"]), # primary parallelization is across sequence length
+            B * H, # further parallalization across the dimensions that don't matter 
+        )
+        
+        flash_attention.attn_fwd[grid](
+            q, k, v, O, LSE,
+            scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+            LSE.stride(0), LSE.stride(1), LSE.stride(2),
+            B, H, N, D,
+        )
+        
+        ctx.save_for_backward(q, k, v, O, LSE)
+        ctx.grid = grid
+        ctx.B, ctx.H, ctx.N, ctx.D = B, H, N, D
+        ctx.scale = scale
+        return O
+    
+    @staticmethod
+    def backward(ctx, dO):
+        q, k, v, O, LSE = ctx.saved_tensors
+        grid = ctx.grid
+        scale = ctx.scale
+        B, H, N, D = ctx.B, ctx.H, ctx.N, ctx.D
+        
+        dLdq = torch.empty_like(q)
+        dLdk = torch.empty_like(k)
+        dLdv = torch.empty_like(v)
+        
+        dLdO = dLdO.contiguous()
+        assert q.stride() == k.stride() == v.stride() == dLdO.stride() == O.stride(), \
+            "q, k, v, dLdO, O must have the same stride"
+        
+        Delta = torch.empty_like(LSE)
+        # the ordering of your grid matters because it determines which programs end up sharing the same SM
+        pre_grid = lambda meta: (
+            triton.cdiv(N, meta["PRE_BLOCK_SIZE_ROW"]), B * H
+        )
+        flash_attention.attn_backward_preprocess[pre_grid](
+            O, dLdO, Delta,
+            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+            dLdO.stride(0), dLdO.stride(1), dLdO.stride(2), dLdO.stride(3),
+            Delta.stride(0), Delta.stride(1), Delta.stride(2),
+            N, D,
+        )
+
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_MACRO"]), B * H) 
+        flash_attention.attn_backward[grid](
+            q, k, v,
+            dLdO, dLdq, dLdk, dLdv,
+            LSE, Delta,
+            scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3), # all tensors should share same stride
+            H, N, D,
+        )
+        
+        return dLdq, dLdk, dLdv, None
+
+flashattention_fn = _flashattention.apply
+
+# Define the operations list based on input args
+def get_flashattention_args(args):
+    ops = []
+    if args.all or args.flash:
+        ops.append("flash")
+    return ops
+
+# First define an empty list that will be populated before the decorator is used
+flashattention_configs = []
+def generate_flashattention_configs(ops):
+    configs = []
+    for op in ops:
+        for mode in ["fwd", "bwd"]:
+            configs.append(
+                triton.testing.Benchmark(
+                    x_names=['N'],
+                    x_vals=[512 * i for i in range(1, 17, 1)],
+                    line_arg='provider',
+                    line_vals=['torch', 'triton'],
+                    line_names=['PyTorch', 'Triton'],
+                    styles=[('blue', '-'), ('red', '-')],
+                    ylabel='TFLOPs/s',
+                    xlabel="sequence length (N)",
+                    plot_name=f'{op}_{mode}',
+                    args={"op": op, "mode": mode,},
+                ))
+    return configs
+
+
+@triton.testing.perf_report(flashattention_configs)
+def benchmark_flashattention(N, provider, op, mode, device=DEVICE):
+    """
+    Benchmark Triton flashattention kernels against PyTorch.
+    """
+    # Generate input data 
+    B, H, Dh = 32, 4, 128
+    scale = sqrt(64)
+    q = torch.randn((B, H, N, Dh), dtype = torch.float32, device = device, requires_grad = True) * 0.02
+    k = torch.randn((B, H, N, Dh), dtype = torch.float32, device = device, requires_grad = True) * 0.02
+    v = torch.randn((B, H, N, Dh), dtype = torch.float32, device = device, requires_grad = True) * 0.02
+    
+    # Select implementation
+    if provider == "torch":
+        fn = lambda: flashattention_fn(q, k, v, scale)
+    else:
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+    if mode == "bwd":
+        O = fn()
+        dO = torch.randn_like(O)
+        fn = lambda: O.backward(dO, retain_graph=True)    
+        
+    ms = triton.testing.do_bench(fn)
+    flops_per_matmul = 2.0 * B * H * N * N * Dh
+    total_flops = 2 * flops_per_matmul * 0.5  # 0.5 for causal
+    if mode == "bwd":
+        total_flops *= 2.5 # 2.0 (bwd) + 0.5 (recompute)
+    return total_flops *1e-12 / (ms * 1e-3)
+
 
 if __name__ == "__main__":
     import argparse
@@ -841,3 +985,9 @@ if __name__ == "__main__":
         print("\nRunning LayerNorm module benchmarks...")
         layernorm_configs.extend(generate_layernorm_configs(layernorm_args))
         benchmark_layernorm.run(print_data=True, save_path='./benchmarks/')
+        
+    flashattention_args = get_flashattention_args(args)
+    if flashattention_args:
+        print("\nRunning Flash Attention module benchmarks...")
+        flashattention_configs.extend(generate_flashattention_configs(flashattention_args))
+        benchmark_flashattention.run(print_data=True, save_path='./benchmarks/')
